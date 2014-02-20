@@ -1,0 +1,15 @@
+......../Users/bkappes/src/pymatgen/pymatgen/io/vaspio/vasp_input.py:307: UserWarning: Elements in POSCAR cannot be determined. Defaulting to false names H He.
+  .format(" ".join(atomic_symbols)))
+......F...............
+======================================================================
+FAIL: test_from_functional_and_symbols (pymatgen.io.vaspio.tests.test_vasp_input.PotcarSingleTest)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/bkappes/src/pymatgen/pymatgen/io/vaspio/tests/test_vasp_input.py", line 357, in test_from_functional_and_symbols
+    self.assertEqual(p.enmax, 271.649)
+AssertionError: 499.034 != 271.649
+
+----------------------------------------------------------------------
+Ran 30 tests in 36.474s
+
+FAILED (failures=1)

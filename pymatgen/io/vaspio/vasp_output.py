@@ -33,6 +33,7 @@ from pymatgen.util.coord_utils import get_points_in_sphere_pbc
 from pymatgen.util.io_utils import zopen, clean_lines, micro_pyawk, \
     clean_json, reverse_readline
 from pymatgen.core.structure import Structure
+from pymatgen.core.structured_grid import StructuredGrid
 from pymatgen.core.units import unitized
 from pymatgen.core.composition import Composition
 from pymatgen.electronic_structure.core import Spin, Orbital
@@ -1465,9 +1466,11 @@ class Outcar(object):
         return d
 
 
-class VolumetricData(object):
+class VolumetricData(StructuredGrid):
     """
-    Simple volumetric object for reading LOCPOT and CHGCAR type files.
+    Simple volumetric object for reading LOCPOT and CHGCAR type files. This
+    is stored as a float array for non-spin polarized calculations and
+    np.dtype([('total', float), ('diff', float)]) for spin polarized.
 
     .. attribute:: structure
 
@@ -1477,23 +1480,13 @@ class VolumetricData(object):
 
         True if run is spin polarized
 
-    ..attribute:: dim
-
-        Tuple of dimensions of volumetric grid in each direction (nx, ny, nz).
-
-    ..attribute:: data
-
-        Actual data as a dict of {string: np.array}. The string are "total"
-        and "diff", in accordance to the output format of vasp LOCPOT and
-        CHGCAR files where the total spin density is written first, followed
-        by the difference spin density.
-
     .. attribute:: ngridpts
 
         Total number of grid points in volumetric data.
     """
-    def __init__(self, structure, data, distance_matrix=None):
+    def __new__(subclass, structure, data, distance_matrix=None, buffer=None):
         """
+        Creates a new structure object explicitly based on StructuredGrid.
         Typically, this constructor is not used directly and the static
         from_file constructor is used. This constructor is designed to allow
         summation and other operations between VolumetricData objects.
@@ -1508,14 +1501,40 @@ class VolumetricData(object):
                 distance_matrices between sums, shortcircuiting an otherwise
                 expensive operation.
         """
-        self.structure = structure
-        self.is_spin_polarized = len(data) == 2
-        self.dim = data["total"].shape
-        self.data = data
-        self.ngridpts = self.dim[0] * self.dim[1] * self.dim[2]
+        # The resulting object shares memory with data, so any change
+        # made to the values in this VolumetricData object will also change
+        # the values in data.
+        obj = StructuredGrid.__new__(subclass, structure, data.shape,
+                                     dtype=data.dtype, buffer=data)
+        # additional attributes
+        obj.is_spin_polarized = obj.dtype.names and len(obj.dtype.names) == 2
+        obj.ngridpts = np.product(obj.shape)
         #lazy init the spin data since this is not always needed.
-        self._spin_data = {}
-        self._distance_matrix = {} if not distance_matrix else distance_matrix
+        obj._spin_data = {}
+        obj._distance_matrix = {} if not distance_matrix else distance_matrix
+        return obj
+        
+    def __finalize_array__(self, obj):
+        """
+        Mechanism used by numpy.ndarray to handle instantiation of objects
+        constructed either explicitly or through view casting or new-from-
+        template
+        """
+        # explicit contruction
+        if obj is None:
+            return
+        # view casting or new-from-template
+        self.structure = getattr(obj, 'structure', Structure(lattice=np.eye(3),
+                                                             species=[],
+                                                             coords=[]))
+        self.is_spin_polarized = getattr(obj, 'is_spin_polarized',
+                                         len(obj.dtype.names) == 2)
+        self.ngridpts = getattr(obj, 'ngridpts', np.product(obj.shape))
+        self._spin_data = getattr(obj, '_spin_data', {})
+        self._distance_matrix = getattr(obj, '_distance_matrix', {})
+        # deprecated, but kept for backward compatiblity
+        self._data = {}
+        self._dim = None
 
     @property
     def spin_data(self):
@@ -1527,12 +1546,41 @@ class VolumetricData(object):
         """
         if not self._spin_data:
             spin_data = dict()
-            spin_data[Spin.up] = 0.5 * (self.data["total"] +
-                                        self.data.get("diff", 0))
-            spin_data[Spin.down] = 0.5 * (self.data["total"] -
-                                          self.data.get("diff", 0))
+            if self.is_spin_polarized:
+                spin_data[Spin.up] = 0.5 * np.asarray(self['total'] +
+                                                      self['diff'])
+                spin_data[Spin.down] = 0.5 * np.asarray(self['total'] -
+                                                        self['diff'])
+            else:
+                spin_data[Spin.up] = 0.5 * np.asarray(self)
+                spin_data[Spin.down] = 0.5 * np.asarray(self)
             self._spin_data = spin_data
         return self._spin_data
+    
+    @property
+    def data(self):
+        """
+        Maintains backward compatibility with earler versions of
+        pymatgen VolumetricData
+        """
+        warnings.warn("deprecated", DeprecationWarning)
+        if not self._data:
+            if self.is_spin_polarized:
+                self._data = {'total': np.asarray(self['total']),
+                              'diff': np.asarray(self['diff'])}
+            else:
+                self._data = {'total': np.asarray(self),
+                              'diff': 0}
+        return self._data
+    
+    @property
+    def dim(self):
+        """
+        Maintains backward compatibility with earlier versions of
+        pymatgen VolumetricData
+        """
+        warnings.warn("deprecated", DeprecationWarning)
+        return self.shape
 
     def get_axis_grid(self, ind):
         """
@@ -1542,10 +1590,9 @@ class VolumetricData(object):
             ind:
                 Axis index.
         """
-        ng = self.dim
-        num_pts = ng[ind]
-        lengths = self.structure.lattice.abc
-        return [i / num_pts * lengths[ind] for i in xrange(num_pts)]
+        num_pts = self.shape[ind]
+        length = self.structure.lattice.abc[ind]
+        return [i / num_pts * length for i in xrange(num_pts)]
 
     def __add__(self, other):
         return self.linear_add(other, 1.0)
@@ -1568,14 +1615,18 @@ class VolumetricData(object):
         Returns:
             VolumetricData corresponding to self + scale_factor * other.
         """
-        if self.structure != other.structure:
-            raise ValueError("Adding or subtraction operations can only be "
+        if self.shape != other.shape or self.structure != other.structure:
+            raise ValueError("Addition or subtraction operations can only be "
                              "performed for volumetric data with the exact "
                              "same structure.")
         #To add checks
-        data = {}
-        for k in self.data.keys():
-            data[k] = self.data[k] + scale_factor * other.data[k]
+        data = np.ndarray(self.shape, dtype=self.dtype)
+        if self.is_spin_polarized:
+            for k in self.dtype.names:
+                data[k] = np.asarray(self[k]) + \
+                          scale_factor * np.asarray(other[k])
+        else:
+            data = np.asarray(self) + scale_factor * np.asarray(other)
         return VolumetricData(self.structure, data, self._distance_matrix)
 
     @staticmethod
@@ -1610,7 +1661,7 @@ class VolumetricData(object):
                         if data_count < ngrid_pts:
                             #This complicated procedure is necessary because
                             #vasp outputs x as the fastest index, followed by y
-                            #then z.
+                            #then z, i.e. fortran ('F') ordered array
                             x = data_count % dim[0]
                             y = int(math.floor(data_count / dim[0])) % dim[1]
                             z = int(math.floor(data_count / dim[0] / dim[1]))
@@ -1636,9 +1687,12 @@ class VolumetricData(object):
                     read_dataset = True
                     dataset = np.zeros(dim)
             if len(all_dataset) == 2:
-                data = {"total": all_dataset[0], "diff": all_dataset[1]}
+                data = np.ndarray(dim, dtype=np.dtype([('total', float),
+                                                       ('diff', float)]))
+                data['total'] = all_dataset[0]
+                data['diff'] = all_dataset[1]
             else:
-                data = {"total": all_dataset[0]}
+                data = all_dataset[0]
             return poscar, data
 
     def write_file(self, file_name, vasp4_compatible=False):
@@ -1655,7 +1709,7 @@ class VolumetricData(object):
         f = zopen(file_name, "w")
         p = Poscar(self.structure)
         f.write(p.get_string(vasp4_compatible=vasp4_compatible) + "\n")
-        a = self.dim
+        a = self.shape
         f.write("\n")
 
         def write_spin(data_type):
@@ -1664,7 +1718,7 @@ class VolumetricData(object):
             f.write("{} {} {}\n".format(a[0], a[1], a[2]))
             for (k, j, i) in itertools.product(xrange(a[2]), xrange(a[1]),
                                                xrange(a[0])):
-                lines.append("%0.11e" % self.data[data_type][i, j, k])
+                lines.append("%0.11e" % self[data_type][i, j, k])
                 count += 1
                 if count % 5 == 0:
                     f.write("".join(lines) + "\n")
@@ -1709,7 +1763,7 @@ class VolumetricData(object):
             return data
 
         struct = self.structure
-        a = self.dim
+        a = self.shape
         if ind not in self._distance_matrix or\
                 self._distance_matrix[ind]["max_radius"] < radius:
             coords = []
@@ -1728,7 +1782,7 @@ class VolumetricData(object):
         dists = data[inds, 1]
         data_inds = np.rint(np.mod(list(data[inds, 0]), 1) *
                             np.tile(a, (len(dists), 1)))
-        vals = [self.data["diff"][x, y, z] for x, y, z in data_inds]
+        vals = [self['diff'][x, y, z] for x, y, z in data_inds]
 
         hist, edges = np.histogram(dists, bins=nbins,
                                    range=[0, radius],
@@ -1751,8 +1805,8 @@ class VolumetricData(object):
         Returns:
             Average total along axis
         """
-        m = self.data["total"]
-        ng = self.dim
+        m = np.asarray(self["total"] if self.is_spin_polarized else self)
+        ng = self.shape
         if ind == 0:
             total = np.sum(np.sum(m, axis=1), 1)
         elif ind == 1:
@@ -1766,8 +1820,8 @@ class Locpot(VolumetricData):
     """
     Simple object for reading a LOCPOT file.
     """
-
-    def __init__(self, poscar, data):
+    
+    def __new__(subclass, poscar, data):
         """
         Args:
             poscar:
@@ -1775,8 +1829,22 @@ class Locpot(VolumetricData):
             data:
                 Actual data.
         """
-        VolumetricData.__init__(self, poscar.structure, data)
-        self.name = poscar.comment
+        obj = VolumetricData.__new__(subclass, poscar.structure, data)
+        obj.name = poscar.comment
+        return obj
+    
+    def __finalize_array__(self, obj):
+        """
+        Mechanism used by numpy.ndarray to handle instantiation of objects
+        constructed either explicitly or through view casting or new-from-
+        template. 
+        """
+        if obj is None:
+            return
+        # We should only get here under the circumstance:
+        # >>> loc1 = Locpot.from_file('LOCPOT')
+        # >>> loc2 = loc1[:]
+        self.name = getattr(obj, 'name', 'View of data as Locpot object')
 
     @staticmethod
     def from_file(filename):
@@ -1789,7 +1857,7 @@ class Chgcar(VolumetricData):
     Simple object for reading a CHGCAR file.
     """
 
-    def __init__(self, poscar, data):
+    def __new__(subclass, poscar, data):
         """
         Args:
             poscar:
@@ -1797,10 +1865,44 @@ class Chgcar(VolumetricData):
             data:
                 Actual data.
         """
-        VolumetricData.__init__(self, poscar.structure, data)
-        self.poscar = poscar
-        self.name = poscar.comment
-        self._distance_matrix = {}
+        obj = VolumetricData.__new__(subclass, poscar.structure, data,
+                                     distance_matrix=None)
+        obj.poscar = poscar
+        obj.name = poscar.comment
+        return obj
+    
+    def __finalize_array__(self, obj):
+        """
+        Mechanism used by numpy.ndarray to handle instantiation of objects
+        constructed either explicitly or through view casting or new-from-
+        template. 
+        """
+        if obj is None:
+            return
+        # We should only get here under the circumstance:
+        # >>> chg1 = Chgcar.from_file('CHGCAR')
+        # >>> chg2 = chg1[:]
+        self.poscar = getattr(obj, 'poscar',
+                              Poscar(Structure(np.eye(3),
+                                               species=['H'],
+                                               coords=[(0., 0., 0.)])))
+        self.name = getattr(obj, 'name', 'View of data as Chgcar object')
+    
+    @property
+    def total(self):
+        """Returns the total charge density"""
+        if self.is_spin_polarized:
+            return np.asarray(self['total'])
+        else:
+            return np.asarray(self)
+    
+    @property
+    def diff(self):
+        """Returns the difference in the charge density"""
+        if self.is_spin_polarized:
+            return np.asarray(self['diff'])
+        else:
+            return 0
 
     @staticmethod
     def from_file(filename):
