@@ -179,7 +179,7 @@ class StructuredGrid(np.ndarray):
                 newIndex = list(ijk)
                 for i, obj in enumerate(ijk):
                     # NPA: one index is a slice or ellipsis
-                    if obj.__class__ is slice or obj is Ellipsis:
+                    if isinstance(obj, slice) or obj is Ellipsis:
                         continue
                     # PA: this index is an int
                     if self._is_periodic[i]:
@@ -258,9 +258,6 @@ class StructuredGrid(np.ndarray):
         Args::
         
             coord (required, 3-element iterable of floats): coordinate
-            
-            periodic (optional, bool): Whether to search periodic images of
-                the structure. Default: True
         
         Returns::
         
